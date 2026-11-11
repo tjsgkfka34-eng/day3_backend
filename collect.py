@@ -38,6 +38,35 @@ def fetch_raw(sido: str, service_key: str) -> list[dict]:
     return body["body"].get("items") or []
 
 
+HISTORY_URL = "https://apis.data.go.kr/B552584/ArpltnInforInqireSvc/getMsrstnAcctoRltmMesureDnsty"
+
+
+def fetch_history(station: str, service_key: str, hours: int = 24) -> list[dict]:
+    """한 측정소의 '최근 hours시간' 기록을 받아 온다(예측용 과거 데이터 채우기).
+    이 API의 응답에는 측정소 이름이 없어서 우리가 붙여 준다."""
+    params = {
+        "serviceKey": unquote(service_key),
+        "returnType": "json",
+        "numOfRows": str(hours),
+        "pageNo": "1",
+        "stationName": station,
+        "dataTerm": "DAILY",
+        "ver": "1.0",
+    }
+    r = httpx.get(HISTORY_URL, params=params, timeout=20)
+    r.raise_for_status()
+    text = r.text.strip()
+    if not text.startswith("{"):
+        raise RuntimeError("공공데이터 API 오류(키 확인): " + text[:200])
+    body = r.json()["response"]
+    if body["header"].get("resultCode") != "00":
+        raise RuntimeError("공공데이터 API 오류: " + str(body["header"]))
+    items = body["body"].get("items") or []
+    for it in items:
+        it["stationName"] = station
+    return items
+
+
 # ───────────── ①' 연습용 가짜 원본 — 키 승인 전에도 실습 가능
 DEMO_STATIONS = ["이도동", "연동", "동홍동", "고산리", "성산읍"]
 

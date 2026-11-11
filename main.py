@@ -48,11 +48,48 @@ def run_collect(hours: int = 1) -> dict:
     return entry
 
 
+def run_backfill(hours: int = 24) -> dict:
+    """실제 모드: 측정소별 최근 hours시간 기록을 한 번에 받아 DB에 채운다(예측을 바로 쓰려고).
+    같은 (측정소, 시각)은 덮어쓰므로 여러 번 실행해도 중복되지 않는다."""
+    stations = sorted({it["stationName"] for it in collect.fetch_raw(SIDO, DATA_KEY)
+                       if it.get("stationName")})
+    items, failed = [], []
+    for st in stations:
+        try:
+            items += collect.fetch_history(st, DATA_KEY, hours)
+        except Exception as e:  # 한 측정소가 실패해도 나머지는 계속
+            log.warning("backfill %s 실패: %s", st, type(e).__name__)
+            failed.append(st)
+    rows, stats = collect.clean(items, SIDO, SOURCE)
+    saved = store.save_readings(rows)
+    entry = {"ran_at": datetime.now(timezone.utc).isoformat(), "source": SOURCE,
+             **stats, "saved": saved}
+    store.save_log(entry)
+    log.info("backfill %s stations=%d failed=%d", entry, len(stations), len(failed))
+    return {**entry, "stations": len(stations), "failed": failed}
+
+
+def needs_backfill() -> bool:
+    """실제 모드에서 어느 측정소든 기록이 MIN_POINTS보다 적으면 True"""
+    if DEMO:
+        return False
+    latest = {r["station"] for r in store.recent(SOURCE)}
+    if not latest:
+        return True
+    return any(len(store.history(SOURCE, st)) < predict.MIN_POINTS for st in latest)
+
+
 async def auto_loop():
     """서버가 켜져 있는 동안 COLLECT_MINUTES마다 자동 수집(브라우저가 꺼져 있어도)"""
     # 연습 모드에서 DB가 비어 있으면 예측을 바로 볼 수 있게 72시간치를 한 번 채운다
     if DEMO and not store.recent(SOURCE, 1):
         await asyncio.to_thread(run_collect, 72)
+    # 실제 모드: 기록이 모자라면 과거 24시간을 한 번 채운다(실패해도 서버는 계속 켜진다)
+    try:
+        if await asyncio.to_thread(needs_backfill):
+            await asyncio.to_thread(run_backfill, 24)
+    except Exception:
+        log.exception("과거 데이터 채우기 실패")
     while True:
         try:
             await asyncio.to_thread(run_collect)
@@ -97,6 +134,22 @@ def collect_now(x_admin_token: str = Header(default=""),
         raise HTTPException(401, "x-admin-token이 틀렸습니다")
     try:
         return run_collect(hours if DEMO else 1)
+    except Exception as e:
+        raise HTTPException(502, str(e))
+
+
+@app.post("/backfill")
+def backfill_now(x_admin_token: str = Header(default=""),
+                 hours: int = Query(24, ge=1, le=24, description="측정소별로 몇 시간치를 채울지(최대 24)")):
+    """과거 기록을 지금 한 번 채운다(실제 모드 전용). /collect와 같은 x-admin-token 필요."""
+    if not ADMIN_TOKEN:
+        raise HTTPException(503, "ADMIN_TOKEN을 먼저 설정하세요")
+    if x_admin_token != ADMIN_TOKEN:
+        raise HTTPException(401, "x-admin-token이 틀렸습니다")
+    if DEMO:
+        raise HTTPException(400, "연습 모드에서는 /collect?hours=72를 쓰세요")
+    try:
+        return run_backfill(hours)
     except Exception as e:
         raise HTTPException(502, str(e))
 
